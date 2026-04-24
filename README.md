@@ -2,7 +2,7 @@
 
 This project builds a multimodal RAG pipeline over PDFs using:
 - **Docling** for PDF parsing (text, tables, figures)
-- **OpenRouter** for embeddings + answer generation
+- **OpenRouter or Azure OpenAI** for embeddings + answer generation
 - **Pinecone** as cloud vector database
 - **FastAPI** backend
 - **React (Vite)** chat frontend
@@ -29,14 +29,28 @@ Single server, multiple endpoints:
 Create `.env` in repo root:
 
 ```env
+# OpenRouter (optional if using only Azure)
 OPENROUTER_API_KEY=...
 OPENROUTER_LLM_MODEL=google/gemma-3-27b-it
 EMBED_MODEL=google/gemini-embedding-001
 EMBED_VECTOR_SIZE=3072
 
+# Azure OpenAI (optional if using only OpenRouter)
+AZURE_OPENAI_API_KEY=...
+AZURE_OPENAI_ENDPOINT=...
+AZURE_OPENAI_API_VERSION=2024-10-21
+AZURE_OPENAI_CHAT_MODEL=gpt-4o-mini
+AZURE_OPENAI_CHAT_DEPLOYMENT=gpt-4o-mini
+AZURE_OPENAI_EMBED_MODEL=text-embedding-3-large
+AZURE_OPENAI_EMBED_DEPLOYMENT=text-embedding-3-large
+AZURE_OPENAI_EMBED_VECTOR_SIZE=3072
+
 PINECONE_API_KEY=...
 PINECONE_INDEX_NAME=multimodal-rag
 PINECONE_NAMESPACE=default
+# Used automatically when llm_provider=azure
+AZURE_PINECONE_INDEX_NAME=customer-support-index
+AZURE_PINECONE_NAMESPACE=default
 PINECONE_CLOUD=aws
 PINECONE_REGION=us-east-1
 
@@ -48,6 +62,7 @@ TOP_K=5
 Important:
 - Pinecone index must be **dense** with metric **cosine**
 - `EMBED_VECTOR_SIZE` must match embedding model output dimension
+- In Azure mode, `AZURE_OPENAI_EMBED_VECTOR_SIZE` must match Azure embedding output dimension
 
 ## Run Backend
 
@@ -74,7 +89,15 @@ Frontend default API base URL:
 
 ```bash
 curl -X POST "http://localhost:8000/ingest/pdf" \
-  -F "file=@data/document.pdf"
+  -F "file=@data/document.pdf" \
+  -F "llm_provider=openrouter"
+```
+
+Use Azure provider:
+```bash
+curl -X POST "http://localhost:8000/ingest/pdf" \
+  -F "file=@data/document.pdf" \
+  -F "llm_provider=azure"
 ```
 
 ### 2) Query (retrieve + answer)
@@ -82,7 +105,14 @@ curl -X POST "http://localhost:8000/ingest/pdf" \
 ```bash
 curl -X POST "http://localhost:8000/query" \
   -H "Content-Type: application/json" \
-  -d '{"query":"What is transformer architecture?","top_k":5,"generate_answer":true}'
+  -d '{"query":"What is transformer architecture?","top_k":5,"generate_answer":true,"llm_provider":"openrouter"}'
+```
+
+Use Azure provider:
+```bash
+curl -X POST "http://localhost:8000/query" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"How do I reset my account password?","top_k":5,"generate_answer":true,"llm_provider":"azure"}'
 ```
 
 ### 3) Query (retrieve only)
@@ -90,7 +120,7 @@ curl -X POST "http://localhost:8000/query" \
 ```bash
 curl -X POST "http://localhost:8000/query" \
   -H "Content-Type: application/json" \
-  -d '{"query":"List important tables","top_k":5,"generate_answer":false}'
+  -d '{"query":"List important tables","top_k":5,"generate_answer":false,"llm_provider":"openrouter"}'
 ```
 
 ## Standalone Test Scripts

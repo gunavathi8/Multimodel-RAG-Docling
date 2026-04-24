@@ -1,9 +1,10 @@
 import os
 import tempfile
 from collections.abc import Generator
+from typing import Literal
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -36,13 +37,44 @@ class QueryRequest(BaseModel):
     query: str = Field(..., min_length=1)
     top_k: int = Field(default=5, ge=1, le=20)
     generate_answer: bool = True
+    llm_provider: Literal["openrouter", "azure"] = "openrouter"
 
 
-def _validate_env() -> None:
-    required = ["OPENROUTER_API_KEY", "PINECONE_API_KEY"]
+def _validate_env(provider: Literal["openrouter", "azure"]) -> None:
+    required = ["PINECONE_API_KEY"]
+    if provider == "azure":
+        required.extend(["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"])
+    else:
+        required.append("OPENROUTER_API_KEY")
+
     missing = [k for k in required if not os.getenv(k)]
     if missing:
         raise HTTPException(status_code=500, detail=f"Missing env vars: {', '.join(missing)}")
+
+
+def _resolve_index_name(provider: Literal["openrouter", "azure"]) -> str:
+    if provider == "azure":
+        return os.getenv("AZURE_PINECONE_INDEX_NAME", "customer-support-index")
+    return os.getenv("PINECONE_INDEX_NAME", "multimodal-rag")
+
+
+def _resolve_namespace(provider: Literal["openrouter", "azure"]) -> str:
+    if provider == "azure":
+        return os.getenv("AZURE_PINECONE_NAMESPACE", os.getenv("PINECONE_NAMESPACE", ""))
+    return os.getenv("PINECONE_NAMESPACE", "")
+
+
+def _build_index(provider: Literal["openrouter", "azure"], vector_size: int) -> PineconeIndex:
+    index_name = _resolve_index_name(provider)
+    namespace = _resolve_namespace(provider)
+    logger.info(
+        "Building Pinecone index client | provider=%s index=%s namespace=%s dim=%d",
+        provider,
+        index_name,
+        namespace or "<default>",
+        vector_size,
+    )
+    return PineconeIndex(index_name=index_name, namespace=namespace, vector_size=vector_size)
 
 
 def _collect_stream(stream: Generator[str, None, None]) -> str:
@@ -59,17 +91,25 @@ def health() -> dict:
 
 
 @app.post("/ingest/pdf")
-async def ingest_pdf(file: UploadFile = File(...)) -> dict:
-    logger.info("Ingest endpoint called | filename=%s content_type=%s", file.filename, file.content_type)
-    _validate_env()
+async def ingest_pdf(
+    file: UploadFile = File(...),
+    llm_provider: Literal["openrouter", "azure"] = Form(default="openrouter"),
+) -> dict:
+    logger.info(
+        "Ingest endpoint called | filename=%s content_type=%s provider=%s",
+        file.filename,
+        file.content_type,
+        llm_provider,
+    )
+    _validate_env(llm_provider)
 
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         logger.info("Ingest rejected | non-pdf file=%s", file.filename)
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
-    logger.info("Initialising ingestion dependencies")
-    embedder = EmbedData()
-    index = PineconeIndex()
+    logger.info("Initialising ingestion dependencies | provider=%s", llm_provider)
+    embedder = EmbedData(provider=llm_provider)
+    index = _build_index(provider=llm_provider, vector_size=embedder.vector_size)
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp_path = tmp.name
@@ -80,7 +120,7 @@ async def ingest_pdf(file: UploadFile = File(...)) -> dict:
 
     try:
         logger.info("Ingestion Step 1/4 | Parse start")
-        parse_result = convert_pdf(tmp_path)
+        parse_result = convert_pdf(tmp_path, provider=llm_provider)
         markdown = parse_result["markdown"]
         figures = parse_result["figures"]
         logger.info("Ingestion Step 1/4 | Parse done | markdown_chars=%d figures=%d", len(markdown), len(figures))
@@ -118,6 +158,9 @@ async def ingest_pdf(file: UploadFile = File(...)) -> dict:
 
         return {
             "status": "success",
+            "provider": llm_provider,
+            "index_name": index.index_name,
+            "namespace": index.namespace or "",
             "file": file.filename,
             "markdown_chars": len(markdown),
             "figures": len(figures),
@@ -137,22 +180,25 @@ async def ingest_pdf(file: UploadFile = File(...)) -> dict:
 @app.post("/query")
 def query(req: QueryRequest) -> dict:
     logger.info(
-        "Query endpoint called | query=%s top_k=%d generate_answer=%s",
+        "Query endpoint called | query=%s top_k=%d generate_answer=%s provider=%s",
         req.query[:120],
         req.top_k,
         req.generate_answer,
+        req.llm_provider,
     )
-    _validate_env()
+    _validate_env(req.llm_provider)
 
     logger.info("Query Step 1/2 | Retrieval start")
-    retriever = Retriever(PineconeIndex(), EmbedData())
+    embedder = EmbedData(provider=req.llm_provider)
+    index = _build_index(provider=req.llm_provider, vector_size=embedder.vector_size)
+    retriever = Retriever(index, embedder)
     chunks = retriever.retrieve(req.query, top_k=req.top_k)
     logger.info("Query Step 1/2 | Retrieval done | chunks=%d", len(chunks))
 
     answer = None
     if req.generate_answer:
         logger.info("Query Step 2/2 | Generation start")
-        answer = _collect_stream(generate_response(req.query, chunks))
+        answer = _collect_stream(generate_response(req.query, chunks, provider=req.llm_provider))
         logger.info("Query Step 2/2 | Generation done | answer_chars=%d", len(answer))
     else:
         logger.info("Query Step 2/2 | Generation skipped by request")
@@ -160,6 +206,9 @@ def query(req: QueryRequest) -> dict:
     return {
         "query": req.query,
         "top_k": req.top_k,
+        "provider": req.llm_provider,
+        "index_name": index.index_name,
+        "namespace": index.namespace or "",
         "chunks": chunks,
         "answer": answer,
     }

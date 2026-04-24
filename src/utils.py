@@ -1,12 +1,13 @@
 import base64
 import io
 import os
+from typing import Literal
 
 # logger import must come before any heavy imports
 from src.logger import get_logger
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import AzureOpenAI, OpenAI
 from PIL import Image
 
 from docling.datamodel.base_models import InputFormat
@@ -35,10 +36,24 @@ load_dotenv()
 logger = get_logger(__name__)
 
 VISION_MODEL = os.getenv("OPENROUTER_LLM_MODEL", "google/gemma-3-27b-it")
+AZURE_OPENAI_CHAT_MODEL = os.getenv("AZURE_OPENAI_CHAT_MODEL", "gpt-4o-mini")
+AZURE_OPENAI_CHAT_DEPLOYMENT = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT", AZURE_OPENAI_CHAT_MODEL)
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-_client = OpenAI(
+_openrouter_client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=os.getenv("OPENROUTER_API_KEY"),
+)
+_azure_client = (
+    AzureOpenAI(
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_key=AZURE_OPENAI_API_KEY,
+        api_version=AZURE_OPENAI_API_VERSION,
+    )
+    if AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY
+    else None
 )
 
 
@@ -64,17 +79,30 @@ def _build_converter() -> DocumentConverter:
 # Image summarisation via OpenRouter multimodal LLM
 # ---------------------------------------------------------------------------
 
-def _summarize_image(image: Image.Image, figure_num: int) -> str:
+def _summarize_image(
+    image: Image.Image,
+    figure_num: int,
+    provider: Literal["openrouter", "azure"] = "openrouter",
+) -> str:
     """Send image to OpenRouter multimodal LLM and return a text description."""
-    logger.info("Summarising Figure %d via OpenRouter model '%s'", figure_num, VISION_MODEL)
+    if provider == "azure":
+        if _azure_client is None:
+            raise ValueError("Azure selected for image summarization but AZURE_OPENAI_ENDPOINT/API_KEY missing")
+        client = _azure_client
+        model = AZURE_OPENAI_CHAT_DEPLOYMENT
+    else:
+        client = _openrouter_client
+        model = VISION_MODEL
+
+    logger.info("Summarising Figure %d | provider=%s model=%s", figure_num, provider, model)
 
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     b64_image = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
     try:
-        response = _client.chat.completions.create(
-            model=VISION_MODEL,
+        response = client.chat.completions.create(
+            model=model,
             messages=[
                 {
                     "role": "user",
@@ -110,7 +138,7 @@ def _summarize_image(image: Image.Image, figure_num: int) -> str:
 # Main conversion
 # ---------------------------------------------------------------------------
 
-def convert_pdf(pdf_path: str) -> dict:
+def convert_pdf(pdf_path: str, provider: Literal["openrouter", "azure"] = "openrouter") -> dict:
     """
     Parse a PDF with Docling and return a dict with two keys:
 
@@ -129,7 +157,7 @@ def convert_pdf(pdf_path: str) -> dict:
                            summary injected inline in markdown AND stored
                            separately in "figures" list for dedicated indexing
     """
-    logger.info("Starting PDF conversion: %s", pdf_path)
+    logger.info("Starting PDF conversion: %s | provider=%s", pdf_path, provider)
     converter = _build_converter()
 
     logger.info("Running Docling document conversion...")
@@ -151,7 +179,7 @@ def convert_pdf(pdf_path: str) -> dict:
             try:
                 pil_image = element.get_image(doc)
                 if pil_image is not None:
-                    summary = _summarize_image(pil_image, picture_count)
+                    summary = _summarize_image(pil_image, picture_count, provider=provider)
                 else:
                     logger.warning("Figure %d: no image data returned", picture_count)
                     summary = "[Image could not be extracted]"
@@ -209,6 +237,7 @@ def extract_multimodal_debug(
     max_table_samples: int = 3,
     max_figure_samples: int = 3,
     summarize_images: bool = True,
+    provider: Literal["openrouter", "azure"] = "openrouter",
 ) -> dict:
     """
     Debug helper to inspect Docling multimodal extraction quality.
@@ -218,7 +247,7 @@ def extract_multimodal_debug(
     - sample table markdown blocks
     - sample figure descriptions (optionally via vision model)
     """
-    logger.info("Starting multimodal debug extraction: %s", pdf_path)
+    logger.info("Starting multimodal debug extraction: %s | provider=%s", pdf_path, provider)
     converter = _build_converter()
     result = converter.convert(pdf_path)
     doc = result.document
@@ -253,7 +282,7 @@ def extract_multimodal_debug(
                     if img is not None:
                         width, height = img.size
                         if summarize_images:
-                            description = _summarize_image(img, stats["figures"])
+                            description = _summarize_image(img, stats["figures"], provider=provider)
                 except Exception as e:
                     description = f"[Image extraction failed: {e}]"
 

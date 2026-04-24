@@ -6,6 +6,7 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000
 
 function App() {
   const [pdfFile, setPdfFile] = useState(null);
+  const [llmProvider, setLlmProvider] = useState("openrouter");
   const [ingestLoading, setIngestLoading] = useState(false);
   const [ingestResult, setIngestResult] = useState(null);
   const [ingestError, setIngestError] = useState("");
@@ -38,6 +39,7 @@ function App() {
     try {
       const formData = new FormData();
       formData.append("file", pdfFile);
+      formData.append("llm_provider", llmProvider);
 
       const res = await fetch(`${API_BASE_URL}/ingest/pdf`, {
         method: "POST",
@@ -78,7 +80,8 @@ function App() {
         body: JSON.stringify({
           query: trimmed,
           top_k: Number(topK),
-          generate_answer: true
+          generate_answer: true,
+          llm_provider: llmProvider
         })
       });
 
@@ -116,11 +119,20 @@ function App() {
     <div className="app-shell">
       <aside className="control-panel">
         <h1>Multimodal RAG</h1>
-        <p className="subtle">Docling + Pinecone + OpenRouter</p>
+        <p className="subtle">Docling + Pinecone + OpenRouter/Azure OpenAI</p>
 
         <section className="panel-card">
           <h2>Ingestion</h2>
           <form onSubmit={handleIngest} className="stack">
+            <label htmlFor="provider">LLM Provider</label>
+            <select
+              id="provider"
+              value={llmProvider}
+              onChange={(e) => setLlmProvider(e.target.value)}
+            >
+              <option value="openrouter">OpenRouter</option>
+              <option value="azure">Azure OpenAI</option>
+            </select>
             <label className="file-label" htmlFor="pdf-file">
               Select PDF
             </label>
@@ -138,6 +150,8 @@ function App() {
           {ingestResult ? (
             <div className="metrics">
               <div>File: {ingestResult.file}</div>
+              <div>Provider: {ingestResult.provider}</div>
+              <div>Index: {ingestResult.index_name}</div>
               <div>Text chunks: {ingestResult.text_chunks}</div>
               <div>Figure chunks: {ingestResult.figure_chunks}</div>
               <div>Total chunks: {ingestResult.total_chunks}</div>
@@ -158,6 +172,7 @@ function App() {
             onChange={(e) => setTopK(e.target.value)}
           />
           <p className="subtle">API: {API_BASE_URL}</p>
+          <p className="subtle">Selected provider: {llmProvider}</p>
         </section>
 
         <section className="panel-card">
@@ -231,7 +246,7 @@ function App() {
           <textarea
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Ask about tables, figures, formulas, or summaries..."
+            placeholder="Ask anything..."
             rows={3}
           />
           <button type="submit" disabled={!canSend}>

@@ -89,6 +89,7 @@ body {
 }
 
 input,
+select,
 textarea,
 button {
   font: inherit;
@@ -96,6 +97,7 @@ button {
 
 input[type="file"],
 input[type="number"],
+select,
 textarea {
   width: 100%;
   border: 1px solid var(--border);

@@ -1,4 +1,5 @@
 import os
+from typing import Literal
 from typing import Any
 
 # logger import before openai to ensure env is set
@@ -6,7 +7,7 @@ from src.logger import get_logger
 
 import tiktoken
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import AzureOpenAI, OpenAI
 
 load_dotenv()
 
@@ -14,14 +15,30 @@ logger = get_logger(__name__)
 
 CHUNK_SIZE    = int(os.getenv("CHUNK_SIZE", 1024))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 100))
-EMBED_MODEL   = os.getenv("EMBED_MODEL", "google/gemini-embedding-001")
+OPENROUTER_EMBED_MODEL = os.getenv("EMBED_MODEL", "google/gemini-embedding-001")
+OPENROUTER_VECTOR_SIZE = int(os.getenv("EMBED_VECTOR_SIZE", 3072))
+AZURE_OPENAI_EMBED_MODEL = os.getenv("AZURE_OPENAI_EMBED_MODEL", "text-embedding-3-large")
+AZURE_OPENAI_EMBED_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBED_DEPLOYMENT", AZURE_OPENAI_EMBED_MODEL)
+AZURE_OPENAI_EMBED_VECTOR_SIZE = int(os.getenv("AZURE_OPENAI_EMBED_VECTOR_SIZE", 3072))
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
 # tiktoken cl100k_base for fast token counting — no local model needed
 _TOKENIZER = tiktoken.get_encoding("cl100k_base")
 
-_client = OpenAI(
+_openrouter_client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=os.getenv("OPENROUTER_API_KEY"),
+)
+_azure_client = (
+    AzureOpenAI(
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_key=AZURE_OPENAI_API_KEY,
+        api_version=AZURE_OPENAI_API_VERSION,
+    )
+    if AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY
+    else None
 )
 
 
@@ -108,17 +125,34 @@ def make_figure_chunks(
 # ---------------------------------------------------------------------------
 
 class EmbedData:
-    """Calls the OpenRouter embeddings endpoint — no weights downloaded locally."""
+    """Embedding client wrapper for OpenRouter and Azure OpenAI."""
 
     # OpenRouter recommends batches of ≤ 96 texts per request
     _BATCH_SIZE = 96
 
-    def __init__(self) -> None:
-        logger.info("Embedding provider: OpenRouter | Model: %s", EMBED_MODEL)
+    def __init__(self, provider: Literal["openrouter", "azure"] = "openrouter") -> None:
+        self.provider = provider
+        if self.provider == "azure":
+            if _azure_client is None:
+                raise ValueError("Azure embedding selected but AZURE_OPENAI_ENDPOINT/API_KEY are missing")
+            self.client = _azure_client
+            self.model = AZURE_OPENAI_EMBED_DEPLOYMENT
+            self.vector_size = AZURE_OPENAI_EMBED_VECTOR_SIZE
+        else:
+            self.client = _openrouter_client
+            self.model = OPENROUTER_EMBED_MODEL
+            self.vector_size = OPENROUTER_VECTOR_SIZE
+
+        logger.info(
+            "Embedding provider initialised | provider=%s model=%s dim=%d",
+            self.provider,
+            self.model,
+            self.vector_size,
+        )
 
     def _call_api(self, texts: list[str]) -> list[list[float]]:
-        response = _client.embeddings.create(
-            model=EMBED_MODEL,
+        response = self.client.embeddings.create(
+            model=self.model,
             input=texts,
         )
         # sort by index to preserve order (API may return out-of-order)
@@ -132,7 +166,13 @@ class EmbedData:
             return []
 
         texts = [c["text"] for c in chunks]
-        logger.info("Embedding %d chunks via OpenRouter (batch_size=%d)...", len(texts), self._BATCH_SIZE)
+        logger.info(
+            "Embedding %d chunks | provider=%s model=%s batch_size=%d",
+            len(texts),
+            self.provider,
+            self.model,
+            self._BATCH_SIZE,
+        )
 
         all_embeddings: list[list[float]] = []
         for i in range(0, len(texts), self._BATCH_SIZE):

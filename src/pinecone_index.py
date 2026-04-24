@@ -23,39 +23,48 @@ VECTOR_SIZE = int(os.getenv("EMBED_VECTOR_SIZE", 3072))
 class PineconeIndex(VectorStore):
     """Pinecone Cloud vector store."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        index_name: str | None = None,
+        namespace: str | None = None,
+        vector_size: int | None = None,
+    ) -> None:
         if not PINECONE_API_KEY:
             raise ValueError("PINECONE_API_KEY is required for PineconeIndex")
 
+        self.index_name = index_name or PINECONE_INDEX_NAME
+        self.namespace = PINECONE_NAMESPACE if namespace is None else namespace
+        self.vector_size = vector_size or VECTOR_SIZE
+
         logger.info(
             "Initialising Pinecone client | index=%s namespace=%s cloud=%s region=%s dim=%d",
-            PINECONE_INDEX_NAME,
-            PINECONE_NAMESPACE or "<default>",
+            self.index_name,
+            self.namespace or "<default>",
             PINECONE_CLOUD,
             PINECONE_REGION,
-            VECTOR_SIZE,
+            self.vector_size,
         )
         self.pc = Pinecone(api_key=PINECONE_API_KEY)
         self._ensure_index()
-        self.index = self.pc.Index(PINECONE_INDEX_NAME)
+        self.index = self.pc.Index(self.index_name)
 
     def _ensure_index(self) -> None:
         existing = self._list_index_names()
-        if PINECONE_INDEX_NAME in existing:
-            logger.info("Pinecone index '%s' already exists", PINECONE_INDEX_NAME)
+        if self.index_name in existing:
+            logger.info("Pinecone index '%s' already exists", self.index_name)
             return
 
-        logger.info("Creating Pinecone index '%s' (dim=%d, metric=cosine)", PINECONE_INDEX_NAME, VECTOR_SIZE)
+        logger.info("Creating Pinecone index '%s' (dim=%d, metric=cosine)", self.index_name, self.vector_size)
         self.pc.create_index(
-            name=PINECONE_INDEX_NAME,
-            dimension=VECTOR_SIZE,
+            name=self.index_name,
+            dimension=self.vector_size,
             metric="cosine",
             spec=ServerlessSpec(
                 cloud=PINECONE_CLOUD,
                 region=PINECONE_REGION,
             ),
         )
-        logger.info("Pinecone index '%s' created", PINECONE_INDEX_NAME)
+        logger.info("Pinecone index '%s' created", self.index_name)
 
     def _list_index_names(self) -> set[str]:
         listing = self.pc.list_indexes()
@@ -82,7 +91,7 @@ class PineconeIndex(VectorStore):
             "Upserting into Pinecone | chunks=%d embeddings=%d namespace=%s",
             len(chunks),
             len(embeddings),
-            PINECONE_NAMESPACE or "<default>",
+            self.namespace or "<default>",
         )
         vectors = [
             {
@@ -97,19 +106,19 @@ class PineconeIndex(VectorStore):
             }
             for chunk, emb in zip(chunks, embeddings)
         ]
-        self.index.upsert(vectors=vectors, namespace=PINECONE_NAMESPACE)
+        self.index.upsert(vectors=vectors, namespace=self.namespace)
         logger.info("Pinecone upsert complete | vectors=%d", len(vectors))
 
     def search(self, query_vector: list[float], top_k: int = 5) -> list[dict[str, Any]]:
         logger.info(
             "Searching Pinecone | top_k=%d namespace=%s",
             top_k,
-            PINECONE_NAMESPACE or "<default>",
+            self.namespace or "<default>",
         )
         response = self.index.query(
             vector=query_vector,
             top_k=top_k,
-            namespace=PINECONE_NAMESPACE,
+            namespace=self.namespace,
             include_metadata=True,
         )
         matches = response.get("matches", [])
@@ -133,14 +142,14 @@ class PineconeIndex(VectorStore):
         logger.info("Fetching Pinecone index stats for count")
         stats = self.index.describe_index_stats()
         namespaces = stats.get("namespaces", {})
-        if PINECONE_NAMESPACE:
-            total = int(namespaces.get(PINECONE_NAMESPACE, {}).get("vector_count", 0))
+        if self.namespace:
+            total = int(namespaces.get(self.namespace, {}).get("vector_count", 0))
         else:
             total = int(stats.get("total_vector_count", 0))
-        logger.info("Pinecone vector count=%d namespace=%s", total, PINECONE_NAMESPACE or "<default>")
+        logger.info("Pinecone vector count=%d namespace=%s", total, self.namespace or "<default>")
         return total
 
     def delete_collection(self) -> None:
-        logger.info("Deleting all vectors from Pinecone namespace=%s", PINECONE_NAMESPACE or "<default>")
-        self.index.delete(delete_all=True, namespace=PINECONE_NAMESPACE)
+        logger.info("Deleting all vectors from Pinecone namespace=%s", self.namespace or "<default>")
+        self.index.delete(delete_all=True, namespace=self.namespace)
         logger.info("Pinecone namespace cleared")

@@ -38,6 +38,7 @@ class QueryRequest(BaseModel):
     top_k: int = Field(default=5, ge=1, le=20)
     generate_answer: bool = True
     llm_provider: Literal["openrouter", "azure"] = "openrouter"
+    use_dynamic_retrieval: bool = True
 
 
 def _validate_env(provider: Literal["openrouter", "azure"]) -> None:
@@ -82,6 +83,55 @@ def _collect_stream(stream: Generator[str, None, None]) -> str:
     for token in stream:
         parts.append(token)
     return "".join(parts)
+
+
+def _compute_dynamic_top_k(query: str, base_top_k: int) -> int:
+    """
+    Estimate query complexity and return a bounded retrieval count.
+    Keeps lower bound at base_top_k and upper bound at 12.
+    """
+    max_top_k = 12
+    q = query.lower().strip()
+    words = [w for w in q.split() if w]
+
+    complexity_score = 0
+
+    # Longer questions tend to include more requirements/details.
+    if len(words) >= 12:
+        complexity_score += 1
+    if len(words) >= 20:
+        complexity_score += 1
+
+    # Multi-intent support queries commonly use connectors.
+    multi_intent_markers = [
+        " and ",
+        " also ",
+        " then ",
+        " plus ",
+    ]
+    if any(marker in f" {q} " for marker in multi_intent_markers):
+        complexity_score += 1
+
+    # Explicit deep/explanatory intent.
+    deep_intent_terms = [
+        "explain",
+        "in detail",
+        "step by step",
+        "how to",
+        "why",
+        "difference",
+        "compare",
+        "best practice",
+        "troubleshoot",
+    ]
+    matched_terms = sum(1 for term in deep_intent_terms if term in q)
+    if matched_terms >= 2:
+        complexity_score += 1
+    if matched_terms >= 4:
+        complexity_score += 1
+
+    effective_top_k = min(max_top_k, max(base_top_k, base_top_k + complexity_score * 2))
+    return effective_top_k
 
 
 @app.get("/health")
@@ -188,11 +238,22 @@ def query(req: QueryRequest) -> dict:
     )
     _validate_env(req.llm_provider)
 
+    effective_top_k = req.top_k
+    if req.use_dynamic_retrieval:
+        effective_top_k = _compute_dynamic_top_k(req.query, req.top_k)
+        logger.info(
+            "Dynamic retrieval enabled | base_top_k=%d effective_top_k=%d",
+            req.top_k,
+            effective_top_k,
+        )
+    else:
+        logger.info("Dynamic retrieval disabled | using top_k=%d", effective_top_k)
+
     logger.info("Query Step 1/2 | Retrieval start")
     embedder = EmbedData(provider=req.llm_provider)
     index = _build_index(provider=req.llm_provider, vector_size=embedder.vector_size)
     retriever = Retriever(index, embedder)
-    chunks = retriever.retrieve(req.query, top_k=req.top_k)
+    chunks = retriever.retrieve(req.query, top_k=effective_top_k)
     logger.info("Query Step 1/2 | Retrieval done | chunks=%d", len(chunks))
 
     answer = None
@@ -206,6 +267,8 @@ def query(req: QueryRequest) -> dict:
     return {
         "query": req.query,
         "top_k": req.top_k,
+        "effective_top_k": effective_top_k,
+        "use_dynamic_retrieval": req.use_dynamic_retrieval,
         "provider": req.llm_provider,
         "index_name": index.index_name,
         "namespace": index.namespace or "",

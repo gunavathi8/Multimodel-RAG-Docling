@@ -3,6 +3,13 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+const SAMPLE_QUESTIONS = [
+  "How do I upload a document?",
+  "How do I delete multiple documents?",
+  "What are relationships in Revealr?",
+  "Why do we need to add levels?",
+  "How do I use section relationships step by step?"
+];
 
 function App() {
   const [pdfFile, setPdfFile] = useState(null);
@@ -13,6 +20,7 @@ function App() {
 
   const [query, setQuery] = useState("");
   const [topK, setTopK] = useState(5);
+  const [useDynamicRetrieval, setUseDynamicRetrieval] = useState(true);
   const [chatLoading, setChatLoading] = useState(false);
   const [chatError, setChatError] = useState("");
   const [messages, setMessages] = useState([]);
@@ -81,7 +89,8 @@ function App() {
           query: trimmed,
           top_k: Number(topK),
           generate_answer: true,
-          llm_provider: llmProvider
+          llm_provider: llmProvider,
+          use_dynamic_retrieval: useDynamicRetrieval
         })
       });
 
@@ -113,6 +122,10 @@ function App() {
     } finally {
       setChatLoading(false);
     }
+  }
+
+  function handleSampleQuestionClick(sampleQuestion) {
+    setQuery(sampleQuestion);
   }
 
   return (
@@ -171,6 +184,15 @@ function App() {
             value={topK}
             onChange={(e) => setTopK(e.target.value)}
           />
+          <label className="checkbox-label" htmlFor="dynamic-retrieval">
+            <input
+              id="dynamic-retrieval"
+              type="checkbox"
+              checked={useDynamicRetrieval}
+              onChange={(e) => setUseDynamicRetrieval(e.target.checked)}
+            />
+            Use dynamic chunk retrieval (recommended)
+          </label>
           <p className="subtle">API: {API_BASE_URL}</p>
           <p className="subtle">Selected provider: {llmProvider}</p>
         </section>
@@ -207,10 +229,21 @@ function App() {
         </div>
 
         <div className="chat-history">
+          <div className="sample-questions">
+            {SAMPLE_QUESTIONS.map((sampleQuestion) => (
+              <button
+                key={sampleQuestion}
+                type="button"
+                className="sample-question-btn"
+                onClick={() => handleSampleQuestionClick(sampleQuestion)}
+                disabled={chatLoading}
+              >
+                {sampleQuestion}
+              </button>
+            ))}
+          </div>
           {messages.length === 0 ? (
-            <div className="empty-state">
-              <p>Start by ingesting a PDF, then ask your first question.</p>
-            </div>
+            <div className="empty-state" />
           ) : (
             messages.map((msg, idx) => (
               <div
@@ -246,7 +279,7 @@ function App() {
           <textarea
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Ask anything..."
+            placeholder="Ask anything about Revealr.ai..."
             rows={3}
           />
           <button type="submit" disabled={!canSend}>

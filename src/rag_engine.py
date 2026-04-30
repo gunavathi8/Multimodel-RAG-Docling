@@ -52,24 +52,58 @@ def _build_user_prompt(query: str, context_chunks: list[dict[str, Any]]) -> str:
     )
 
 
+def _build_user_prompt_with_history(
+    query: str,
+    context_chunks: list[dict[str, Any]],
+    chat_history: list[dict[str, str]] | None = None,
+) -> str:
+    history_blocks = ""
+    if chat_history:
+        lines: list[str] = []
+        for turn in chat_history:
+            role = turn.get("role", "user")
+            content = turn.get("content", "")
+            if content:
+                lines.append(f"{role.upper()}: {content}")
+        if lines:
+            history_blocks = "Recent conversation history:\n\n" + "\n\n".join(lines) + "\n\n"
+
+    context_blocks = "\n\n---\n\n".join(
+        f"[Source: {c['source']} | chunk {c['chunk_id']}]\n{c['text']}"
+        for c in context_chunks
+    )
+    return (
+        f"{history_blocks}"
+        f"Context from the document:\n\n"
+        f"{context_blocks}\n\n"
+        f"Current question: {query}\n\n"
+        f"Answer based only on the context above. Use conversation history only to resolve references."
+    )
+
+
+def _get_client_and_model(
+    provider: Literal["openrouter", "azure"],
+    model: str | None = None,
+) -> tuple[Any, str]:
+    if provider == "azure":
+        if _azure_client is None:
+            raise ValueError("Azure chat selected but AZURE_OPENAI_ENDPOINT/API_KEY are missing")
+        return _azure_client, (model or AZURE_OPENAI_CHAT_DEPLOYMENT)
+    return _openrouter_client, (model or OPENROUTER_LLM_MODEL)
+
+
 def generate_response(
     query: str,
     context_chunks: list[dict[str, Any]],
     provider: Literal["openrouter", "azure"] = "openrouter",
     model: str | None = None,
+    chat_history: list[dict[str, str]] | None = None,
 ) -> Generator[str, None, None]:
     """
     Stream the LLM response token by token via OpenRouter.
     Yields individual string tokens so the Streamlit UI can display them as they arrive.
     """
-    if provider == "azure":
-        if _azure_client is None:
-            raise ValueError("Azure chat selected but AZURE_OPENAI_ENDPOINT/API_KEY are missing")
-        client = _azure_client
-        active_model = model or AZURE_OPENAI_CHAT_DEPLOYMENT
-    else:
-        client = _openrouter_client
-        active_model = model or OPENROUTER_LLM_MODEL
+    client, active_model = _get_client_and_model(provider=provider, model=model)
 
     logger.info(
         "Generating response | provider=%s model=%s context_chunks=%d",
@@ -77,7 +111,7 @@ def generate_response(
         active_model,
         len(context_chunks),
     )
-    user_prompt = _build_user_prompt(query, context_chunks)
+    user_prompt = _build_user_prompt_with_history(query, context_chunks, chat_history=chat_history)
     logger.info("Prompt assembled — context length: %d chars", len(user_prompt))
 
     stream = client.chat.completions.create(

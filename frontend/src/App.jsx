@@ -12,6 +12,7 @@ const SAMPLE_QUESTIONS = [
 ];
 
 function App() {
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [pdfFile, setPdfFile] = useState(null);
   const [llmProvider, setLlmProvider] = useState("openrouter");
   const [ingestLoading, setIngestLoading] = useState(false);
@@ -76,11 +77,27 @@ function App() {
     setChatError("");
 
     const userMessage = { role: "user", content: trimmed };
-    setMessages((prev) => [...prev, userMessage]);
+    const historyPayload = messages
+      .filter((m) => m.role === "user" || m.role === "assistant")
+      .slice(-5)
+      .map((m) => ({
+        role: m.role,
+        content: m.content
+      }));
+    const assistantIndexRef = { value: -1 };
+    setMessages((prev) => {
+      const next = [
+        ...prev,
+        userMessage,
+        { role: "assistant", content: "" }
+      ];
+      assistantIndexRef.value = next.length - 1;
+      return next;
+    });
     setQuery("");
 
     try {
-      const res = await fetch(`${API_BASE_URL}/query`, {
+      const res = await fetch(`${API_BASE_URL}/query/stream`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json"
@@ -90,35 +107,78 @@ function App() {
           top_k: Number(topK),
           generate_answer: true,
           llm_provider: llmProvider,
-          use_dynamic_retrieval: useDynamicRetrieval
+          use_dynamic_retrieval: useDynamicRetrieval,
+          chat_history: historyPayload
         })
       });
 
-      const data = await res.json();
       if (!res.ok) {
+        const data = await res.json();
         throw new Error(data.detail || "Query failed");
       }
 
-      setLatestChunks(data.chunks || []);
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content:
-            data.answer && data.answer.trim().length > 0
-              ? data.answer
-              : "No answer generated."
+      const reader = res.body?.getReader();
+      if (!reader) {
+        throw new Error("Streaming not supported by browser.");
+      }
+
+      const decoder = new TextDecoder("utf-8");
+      let buffer = "";
+      let assistantText = "";
+      let receivedDone = false;
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const events = buffer.split("\n\n");
+        buffer = events.pop() || "";
+
+        for (const eventBlock of events) {
+          const line = eventBlock
+            .split("\n")
+            .find((l) => l.startsWith("data: "));
+          if (!line) continue;
+
+          const payload = JSON.parse(line.slice(6));
+          if (payload.type === "meta") {
+            setLatestChunks(payload.chunks || []);
+          } else if (payload.type === "token") {
+            assistantText += payload.token || "";
+            setMessages((prev) =>
+              prev.map((m, idx) =>
+                idx === assistantIndexRef.value
+                  ? { ...m, content: assistantText }
+                  : m
+              )
+            );
+          } else if (payload.type === "done") {
+            receivedDone = true;
+          } else if (payload.type === "error") {
+            throw new Error(payload.message || "Streaming failed");
+          }
         }
-      ]);
+      }
+
+      if (!receivedDone && assistantText.trim().length === 0) {
+        setMessages((prev) =>
+          prev.map((m, idx) =>
+            idx === assistantIndexRef.value
+              ? { ...m, content: "No answer generated." }
+              : m
+          )
+        );
+      }
     } catch (err) {
       setChatError(err.message || "Query failed");
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: "The request failed. Please check backend logs and try again."
-        }
-      ]);
+      setMessages((prev) =>
+        prev.map((m, idx) =>
+          m.role === "assistant" && idx === prev.length - 1
+            ? { ...m, content: "The request failed. Please check backend logs and try again." }
+            : m
+        )
+      );
     } finally {
       setChatLoading(false);
     }
@@ -129,8 +189,24 @@ function App() {
   }
 
   return (
-    <div className="app-shell">
-      <aside className="control-panel">
+    <div className={`app-shell ${isSidebarCollapsed ? "sidebar-collapsed" : ""}`}>
+      <aside className={`control-panel ${isSidebarCollapsed ? "collapsed" : ""}`}>
+        <button
+          type="button"
+          className="sidebar-toggle-btn"
+          onClick={() => setIsSidebarCollapsed((prev) => !prev)}
+          aria-label={isSidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+          title={isSidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+        >
+          {isSidebarCollapsed ? "»" : "«"}
+        </button>
+
+        {isSidebarCollapsed ? (
+          <div className="collapsed-label">Controls</div>
+        ) : null}
+
+        {!isSidebarCollapsed ? (
+          <>
         <h1>Multimodal RAG</h1>
         <p className="subtle">Docling + Pinecone + OpenRouter/Azure OpenAI</p>
 
@@ -220,6 +296,8 @@ function App() {
             )}
           </div>
         </section>
+          </>
+        ) : null}
       </aside>
 
       <main className="chat-panel">
@@ -265,14 +343,6 @@ function App() {
               </div>
             ))
           )}
-          {chatLoading ? (
-            <div className="message-row from-assistant">
-              <div className="message-bubble loading-bubble">
-                <div className="message-role">Assistant</div>
-                <p>Thinking...</p>
-              </div>
-            </div>
-          ) : null}
         </div>
 
         <form className="chat-input" onSubmit={handleSendQuery}>

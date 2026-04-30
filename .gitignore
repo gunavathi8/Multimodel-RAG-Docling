@@ -24,3 +24,5 @@ frontend/node_modules/
 frontend/dist/
 data/
 /prompt_library
+/archieves
+/generated

@@ -1,13 +1,16 @@
 import os
 import tempfile
+import json
 from collections.abc import Generator
 from typing import Literal
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from faq_service.router import router as faq_router
 from src.chunk_embed import EmbedData, chunk_text, make_figure_chunks
 from src.logger import get_logger
 from src.pinecone_index import PineconeIndex
@@ -20,6 +23,7 @@ load_dotenv()
 logger = get_logger(__name__)
 
 app = FastAPI(title="Multimodal RAG API", version="1.0.0")
+app.include_router(faq_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,11 +38,16 @@ app.add_middleware(
 
 
 class QueryRequest(BaseModel):
+    class ChatTurn(BaseModel):
+        role: Literal["user", "assistant"]
+        content: str = Field(..., min_length=1)
+
     query: str = Field(..., min_length=1)
     top_k: int = Field(default=5, ge=1, le=20)
     generate_answer: bool = True
     llm_provider: Literal["openrouter", "azure"] = "openrouter"
     use_dynamic_retrieval: bool = True
+    chat_history: list[ChatTurn] = Field(default_factory=list)
 
 
 def _validate_env(provider: Literal["openrouter", "azure"]) -> None:
@@ -259,7 +268,19 @@ def query(req: QueryRequest) -> dict:
     answer = None
     if req.generate_answer:
         logger.info("Query Step 2/2 | Generation start")
-        answer = _collect_stream(generate_response(req.query, chunks, provider=req.llm_provider))
+        history_payload = [
+            {"role": turn.role, "content": turn.content}
+            for turn in req.chat_history[-5:]
+        ]
+        logger.info("Query memory | using_history_turns=%d", len(history_payload))
+        answer = _collect_stream(
+            generate_response(
+                req.query,
+                chunks,
+                provider=req.llm_provider,
+                chat_history=history_payload,
+            )
+        )
         logger.info("Query Step 2/2 | Generation done | answer_chars=%d", len(answer))
     else:
         logger.info("Query Step 2/2 | Generation skipped by request")
@@ -275,3 +296,68 @@ def query(req: QueryRequest) -> dict:
         "chunks": chunks,
         "answer": answer,
     }
+
+
+@app.post("/query/stream")
+def query_stream(req: QueryRequest) -> StreamingResponse:
+    logger.info(
+        "Query stream endpoint called | query=%s top_k=%d provider=%s",
+        req.query[:120],
+        req.top_k,
+        req.llm_provider,
+    )
+    _validate_env(req.llm_provider)
+
+    effective_top_k = req.top_k
+    if req.use_dynamic_retrieval:
+        effective_top_k = _compute_dynamic_top_k(req.query, req.top_k)
+        logger.info(
+            "Dynamic retrieval enabled (stream) | base_top_k=%d effective_top_k=%d",
+            req.top_k,
+            effective_top_k,
+        )
+
+    embedder = EmbedData(provider=req.llm_provider)
+    index = _build_index(provider=req.llm_provider, vector_size=embedder.vector_size)
+    retriever = Retriever(index, embedder)
+    chunks = retriever.retrieve(req.query, top_k=effective_top_k)
+    logger.info("Query stream retrieval done | chunks=%d", len(chunks))
+
+    history_payload = [
+        {"role": turn.role, "content": turn.content}
+        for turn in req.chat_history[-5:]
+    ]
+
+    def event_stream() -> Generator[str, None, None]:
+        # Send retrieval metadata first so UI can render sources immediately.
+        meta = {
+            "type": "meta",
+            "query": req.query,
+            "top_k": req.top_k,
+            "effective_top_k": effective_top_k,
+            "provider": req.llm_provider,
+            "index_name": index.index_name,
+            "namespace": index.namespace or "",
+            "chunks": chunks,
+        }
+        yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
+
+        if not req.generate_answer:
+            done_payload = {"type": "done", "answer": ""}
+            yield f"data: {json.dumps(done_payload, ensure_ascii=False)}\n\n"
+            return
+
+        try:
+            for token in generate_response(
+                req.query,
+                chunks,
+                provider=req.llm_provider,
+                chat_history=history_payload,
+            ):
+                yield f"data: {json.dumps({'type': 'token', 'token': token}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            logger.exception("Streaming generation failed")
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")

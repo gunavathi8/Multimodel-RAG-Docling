@@ -105,14 +105,14 @@ curl -X POST "http://localhost:8000/ingest/pdf" \
 ```bash
 curl -X POST "http://localhost:8000/query" \
   -H "Content-Type: application/json" \
-  -d '{"query":"What is transformer architecture?","top_k":5,"generate_answer":true,"llm_provider":"openrouter"}'
+  -d '{"query":"What is transformer architecture?","top_k":5,"generate_answer":true,"llm_provider":"openrouter","use_dynamic_retrieval":true}'
 ```
 
 Use Azure provider:
 ```bash
 curl -X POST "http://localhost:8000/query" \
   -H "Content-Type: application/json" \
-  -d '{"query":"How do I reset my account password?","top_k":5,"generate_answer":true,"llm_provider":"azure"}'
+  -d '{"query":"How do I reset my account password?","top_k":5,"generate_answer":true,"llm_provider":"azure","use_dynamic_retrieval":true}'
 ```
 
 ### 3) Query (retrieve only)

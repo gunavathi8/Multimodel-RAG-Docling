@@ -1,0 +1,2 @@
+"""FAQ generation service package."""
+

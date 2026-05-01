@@ -3,6 +3,7 @@ import tempfile
 import json
 from collections.abc import Generator
 from typing import Literal
+import re
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -143,6 +144,115 @@ def _compute_dynamic_top_k(query: str, base_top_k: int) -> int:
     return effective_top_k
 
 
+def _build_retrieval_query(user_query: str) -> str:
+    """
+    Expand user query with domain hints to improve semantic recall on support queries.
+    """
+    q = user_query.strip()
+    ql = q.lower()
+    hints: list[str] = []
+
+    if "relationship" in ql:
+        hints.extend([
+            "document relationships",
+            "section relationships",
+            "glossary relationships",
+            "relationship mapping",
+        ])
+    if "table" in ql or "difference" in ql or "diff" in ql:
+        hints.extend([
+            "comparison",
+            "types",
+            "features",
+            "key differences",
+        ])
+    if "upload" in ql or "not working" in ql or "error" in ql:
+        hints.extend([
+            "troubleshooting",
+            "mandatory fields",
+            "validation",
+            "levels required",
+        ])
+    if any(term in ql for term in ["mandatory", "required", "must", "how many", "minimum"]):
+        hints.extend([
+            "required levels",
+            "minimum levels",
+            "mandatory configuration",
+            "validation rules",
+        ])
+    if "level" in ql or "levels" in ql:
+        hints.extend([
+            "relationship levels",
+            "hierarchy levels",
+            "level setup",
+        ])
+    if any(term in ql for term in ["image", "figure", "screenshot", "diagram", "screen", "ui"]):
+        hints.extend([
+            "figure description",
+            "screenshot instructions",
+            "ui guidance",
+            "visual steps",
+        ])
+
+    if not hints:
+        return q
+    return f"{q}\n\nRelated concepts: {', '.join(hints)}"
+
+
+def _tokenize_for_overlap(text: str) -> set[str]:
+    return {t for t in re.findall(r"[a-z0-9]+", text.lower()) if len(t) > 2}
+
+
+def _rerank_chunks_for_answer(query: str, chunks: list[dict], keep_k: int) -> list[dict]:
+    """
+    Lightweight lexical+semantic rerank to reduce noisy chunks before generation.
+    """
+    ql = query.lower()
+    query_tokens = _tokenize_for_overlap(query)
+    wants_table = any(term in ql for term in ["table", "difference", "diff", "compare"])
+    wants_visual = any(term in ql for term in ["image", "figure", "screenshot", "diagram", "screen", "ui"])
+
+    def chunk_rank(c: dict) -> float:
+        text = (c.get("text") or "").lower()
+        score = float(c.get("score", 0.0))
+        chunk_type = c.get("chunk_type", "text")
+        text_tokens = _tokenize_for_overlap(text)
+        overlap = len(query_tokens.intersection(text_tokens))
+
+        # Base semantic score from vector DB
+        rank = score
+
+        # Balance text/figure preference by query intent.
+        if wants_visual:
+            if chunk_type == "figure":
+                rank += 0.10
+            else:
+                rank -= 0.02
+        elif wants_table:
+            if chunk_type == "text":
+                rank += 0.06
+            else:
+                rank -= 0.01
+        else:
+            if chunk_type == "text":
+                rank += 0.04
+
+        # Lexical overlap helps when semantic scores are close.
+        rank += min(overlap, 8) * 0.01
+
+        # If user asked for comparison table, prioritize chunks that look tabular/comparative.
+        if wants_table:
+            if "|" in text or "table" in text or "types" in text or "difference" in text:
+                rank += 0.08
+        if wants_visual and ("figure" in text or "screenshot" in text or "image" in text or "diagram" in text):
+            rank += 0.08
+
+        return rank
+
+    ranked = sorted(chunks, key=chunk_rank, reverse=True)
+    return ranked[: max(1, keep_k)]
+
+
 @app.get("/health")
 def health() -> dict:
     logger.info("Health check called")
@@ -262,8 +372,11 @@ def query(req: QueryRequest) -> dict:
     embedder = EmbedData(provider=req.llm_provider)
     index = _build_index(provider=req.llm_provider, vector_size=embedder.vector_size)
     retriever = Retriever(index, embedder)
-    chunks = retriever.retrieve(req.query, top_k=effective_top_k)
-    logger.info("Query Step 1/2 | Retrieval done | chunks=%d", len(chunks))
+    retrieval_query = _build_retrieval_query(req.query)
+    chunks = retriever.retrieve(retrieval_query, top_k=effective_top_k)
+    logger.info("Query Step 1/2 | Retrieval done | raw_chunks=%d", len(chunks))
+    chunks = _rerank_chunks_for_answer(req.query, chunks, keep_k=min(effective_top_k, 8))
+    logger.info("Query Step 1/2 | Rerank done | kept_chunks=%d", len(chunks))
 
     answer = None
     if req.generate_answer:
@@ -320,8 +433,11 @@ def query_stream(req: QueryRequest) -> StreamingResponse:
     embedder = EmbedData(provider=req.llm_provider)
     index = _build_index(provider=req.llm_provider, vector_size=embedder.vector_size)
     retriever = Retriever(index, embedder)
-    chunks = retriever.retrieve(req.query, top_k=effective_top_k)
-    logger.info("Query stream retrieval done | chunks=%d", len(chunks))
+    retrieval_query = _build_retrieval_query(req.query)
+    chunks = retriever.retrieve(retrieval_query, top_k=effective_top_k)
+    logger.info("Query stream retrieval done | raw_chunks=%d", len(chunks))
+    chunks = _rerank_chunks_for_answer(req.query, chunks, keep_k=min(effective_top_k, 8))
+    logger.info("Query stream rerank done | kept_chunks=%d", len(chunks))
 
     history_payload = [
         {"role": turn.role, "content": turn.content}

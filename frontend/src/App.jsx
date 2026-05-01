@@ -14,7 +14,7 @@ const SAMPLE_QUESTIONS = [
 function App() {
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [pdfFile, setPdfFile] = useState(null);
-  const [llmProvider, setLlmProvider] = useState("openrouter");
+  const [llmProvider, setLlmProvider] = useState("azure");
   const [ingestLoading, setIngestLoading] = useState(false);
   const [ingestResult, setIngestResult] = useState(null);
   const [ingestError, setIngestError] = useState("");
@@ -26,6 +26,8 @@ function App() {
   const [chatError, setChatError] = useState("");
   const [messages, setMessages] = useState([]);
   const [latestChunks, setLatestChunks] = useState([]);
+  const [copiedMessageIndex, setCopiedMessageIndex] = useState(null);
+  const [messageFeedback, setMessageFeedback] = useState({});
 
   const canSend = useMemo(
     () => query.trim().length > 0 && !chatLoading,
@@ -188,6 +190,26 @@ function App() {
     setQuery(sampleQuestion);
   }
 
+  async function handleCopyResponse(messageIndex, content) {
+    if (!content?.trim()) return;
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopiedMessageIndex(messageIndex);
+      window.setTimeout(() => {
+        setCopiedMessageIndex((current) => (current === messageIndex ? null : current));
+      }, 1200);
+    } catch {
+      setChatError("Could not copy response. Please try again.");
+    }
+  }
+
+  function handleFeedback(messageIndex, value) {
+    setMessageFeedback((prev) => ({
+      ...prev,
+      [messageIndex]: prev[messageIndex] === value ? null : value
+    }));
+  }
+
   return (
     <div className={`app-shell ${isSidebarCollapsed ? "sidebar-collapsed" : ""}`}>
       <aside className={`control-panel ${isSidebarCollapsed ? "collapsed" : ""}`}>
@@ -331,11 +353,52 @@ function App() {
                 <div className="message-bubble">
                   <div className="message-role">{msg.role === "user" ? "You" : "Assistant"}</div>
                   {msg.role === "assistant" ? (
-                    <div className="markdown-block">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                        {msg.content}
-                      </ReactMarkdown>
-                    </div>
+                    <>
+                      <div className="markdown-block">
+                        {chatLoading && !msg.content ? (
+                          <div className="typing-dots" aria-label="Assistant is typing">
+                            <span />
+                            <span />
+                            <span />
+                          </div>
+                        ) : (
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                            {msg.content}
+                          </ReactMarkdown>
+                        )}
+                      </div>
+                      {msg.content?.trim() ? (
+                        <div className="message-actions" aria-label="Assistant message actions">
+                          <button
+                            type="button"
+                            className={`message-action-btn ${copiedMessageIndex === idx ? "active" : ""}`}
+                            onClick={() => handleCopyResponse(idx, msg.content)}
+                            title="Copy response"
+                            aria-label="Copy response"
+                          >
+                            ⧉
+                          </button>
+                          <button
+                            type="button"
+                            className={`message-action-btn ${messageFeedback[idx] === "good" ? "active positive" : ""}`}
+                            onClick={() => handleFeedback(idx, "good")}
+                            title="Good response"
+                            aria-label="Mark as good response"
+                          >
+                            👍
+                          </button>
+                          <button
+                            type="button"
+                            className={`message-action-btn ${messageFeedback[idx] === "bad" ? "active negative" : ""}`}
+                            onClick={() => handleFeedback(idx, "bad")}
+                            title="Bad response"
+                            aria-label="Mark as bad response"
+                          >
+                            👎
+                          </button>
+                        </div>
+                      ) : null}
+                    </>
                   ) : (
                     <p>{msg.content}</p>
                   )}
